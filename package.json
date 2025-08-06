@@ -1,0 +1,35 @@
+{
+  "name": "trading-bot-vercel",
+  "version": "1.0.0",
+  "description": "Trading Bot Flask Application optimized for Vercel deployment",
+  "scripts": {
+    "deploy": "vercel",
+    "deploy:prod": "vercel --prod",
+    "dev": "python app_vercel.py",
+    "install-vercel": "npm install -g vercel",
+    "login": "vercel login",
+    "logs": "vercel logs",
+    "env": "vercel env ls",
+    "domains": "vercel domains"
+  },
+  "keywords": [
+    "trading",
+    "bot",
+    "flask",
+    "vercel",
+    "serverless",
+    "python"
+  ],
+  "author": "Trading Bot Team",
+  "license": "MIT",
+  "devDependencies": {
+    "vercel": "^32.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "."
+  }
+}
