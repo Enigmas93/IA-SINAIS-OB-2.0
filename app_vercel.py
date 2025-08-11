@@ -98,11 +98,48 @@ except ImportError as e:
     
     @main.route('/')
     def index():
-        return render_template('index.html')
+        try:
+            return render_template('index.html')
+        except Exception as e:
+            logger.error(f"Error rendering template: {e}")
+            return f'''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>IA Sinais OB - Sistema de Trading</title>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body>
+                <div class="container mt-5">
+                    <div class="row justify-content-center">
+                        <div class="col-md-8 text-center">
+                            <h1 class="display-4 text-primary mb-4">IA Sinais OB</h1>
+                            <h2 class="h3 text-secondary mb-4">Sistema Inteligente de Trading</h2>
+                            <p class="lead mb-4">Automatize suas operações na IQ Option com análise técnica avançada e Machine Learning.</p>
+                            <div class="alert alert-info">
+                                <h5><i class="fas fa-info-circle"></i> Sistema em Inicialização</h5>
+                                <p>O sistema está sendo configurado. Algumas funcionalidades podem estar temporariamente indisponíveis.</p>
+                            </div>
+                            <div class="d-grid gap-2 d-md-flex justify-content-md-center">
+                                <a href="/api/health" class="btn btn-outline-primary">Status do Sistema</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+            </body>
+            </html>
+            '''
     
     @api.route('/health')
     def health():
-        return {'status': 'ok', 'services_available': services_available}
+        return jsonify({
+            'status': 'ok', 
+            'services_available': services_available,
+            'message': 'Sistema funcionando em modo básico'
+        })
     
     app.register_blueprint(api, url_prefix='/api')
     app.register_blueprint(main)

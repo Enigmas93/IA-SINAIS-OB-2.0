@@ -129,20 +129,44 @@ Certifique-se de que estes arquivos estão no seu projeto:
 - Verifique nomes exatos (case-sensitive)
 - Redeploy após adicionar variáveis
 
+### ✅ Erro Corrigido: "404: NOT_FOUND"
+
+**Problema:** A aplicação estava tentando importar dependências complexas que causavam falhas no ambiente serverless.
+
+**Solução Aplicada:**
+1. **Simplificação do `api/index.py`:** Removidas dependências complexas e criada versão standalone
+2. **Configuração otimizada do `vercel.json`:** Simplificada para configuração mínima funcional
+3. **Template HTML inline:** Removida dependência de arquivos de template externos
+
 ### ❌ Erro: "A propriedade 'functions' não pode ser usada em conjunto com a propriedade 'builds'"
 **Solução**:
 - Este erro ocorre quando há conflito no `vercel.json`
 - Remova a seção `"functions"` do arquivo `vercel.json`
 - Use apenas `"builds"` e `"routes"`
-- O arquivo correto deve ter apenas:
-  ```json
-  {
-    "version": 2,
-    "builds": [...],
-    "routes": [...],
-    "env": {...}
+
+### ✅ Configuração Final Funcional
+
+O arquivo `vercel.json` otimizado:
+```json
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.py"
+    }
+  ],
+  "env": {
+    "FLASK_ENV": "production"
   }
-  ```
+}
+```
 
 ---
 

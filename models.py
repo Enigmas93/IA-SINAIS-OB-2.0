@@ -44,18 +44,27 @@ class TradingConfig(db.Model):
     
     # Risk management
     take_profit = db.Column(db.Float, default=70.0)  # Percentage
-    stop_loss = db.Column(db.Float, default=30.0)    # Percentage
+    # Stop loss is now based on losing all 3 martingale levels (no percentage)
     
     # Martingale configuration
     martingale_enabled = db.Column(db.Boolean, default=True)
     max_martingale_levels = db.Column(db.Integer, default=3)
     martingale_multiplier = db.Column(db.Float, default=2.2)
     
-    # Schedule configuration
+    # Schedule configuration - Only start times (sessions end when targets are reached)
     morning_start = db.Column(db.String(5), default='10:00')
-    morning_end = db.Column(db.String(5), default='12:00')
     afternoon_start = db.Column(db.String(5), default='14:00')
-    afternoon_end = db.Column(db.String(5), default='17:00')
+    night_start = db.Column(db.String(5), default='19:00')
+    
+    # Session enable/disable flags
+    morning_enabled = db.Column(db.Boolean, default=True)
+    afternoon_enabled = db.Column(db.Boolean, default=True)
+    night_enabled = db.Column(db.Boolean, default=False)
+    
+    # Continuous operation settings
+    continuous_mode = db.Column(db.Boolean, default=False)  # Keep running between sessions
+    auto_restart = db.Column(db.Boolean, default=False)     # Auto restart after targets reached
+    keep_connection = db.Column(db.Boolean, default=True)   # Maintain IQ Option connection
     
     # Operation mode
     auto_mode = db.Column(db.Boolean, default=False)
@@ -97,6 +106,9 @@ class TradingConfig(db.Model):
     
     # Timeframe configuration
     timeframe = db.Column(db.String(5), default='1m')  # '1m' (M1) or '5m' (M5)
+    
+    # Advance signal configuration
+    advance_signal_minutes = db.Column(db.Integer, default=2)  # Minutes in advance to send signals
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -253,6 +265,44 @@ class SystemLog(db.Model):
     
     def __repr__(self):
         return f'<SystemLog {self.level} {self.component}>'
+
+class SessionTargets(db.Model):
+    """Daily session targets tracking"""
+    __tablename__ = 'session_targets'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    
+    # Date and session info
+    date = db.Column(db.Date, nullable=False)
+    session_type = db.Column(db.String(10), nullable=False)  # 'morning', 'afternoon', 'night'
+    
+    # Target achievement
+    take_profit_reached = db.Column(db.Boolean, default=False)
+    stop_loss_reached = db.Column(db.Boolean, default=False)
+    target_reached_at = db.Column(db.DateTime)
+    
+    # Session statistics
+    session_profit = db.Column(db.Float, default=0.0)
+    total_trades = db.Column(db.Integer, default=0)
+    winning_trades = db.Column(db.Integer, default=0)
+    losing_trades = db.Column(db.Integer, default=0)
+    
+    # Session duration
+    session_start = db.Column(db.DateTime)
+    session_end = db.Column(db.DateTime)
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Indexes for performance
+    __table_args__ = (
+        db.Index('idx_user_date_session', 'user_id', 'date', 'session_type'),
+        db.UniqueConstraint('user_id', 'date', 'session_type', name='unique_user_date_session')
+    )
+    
+    def __repr__(self):
+        return f'<SessionTargets User:{self.user_id} {self.date} {self.session_type}>'
 
 class MarketData(db.Model):
     """Market data cache for analysis"""

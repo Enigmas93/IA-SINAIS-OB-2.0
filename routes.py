@@ -6,12 +6,35 @@ from sqlalchemy import and_, or_, desc
 import logging
 import json
 import time
+import numpy as np
 from typing import Dict, List, Optional
 from sqlalchemy.orm import joinedload
+from database import db
+
+# Import validation schemas and validators
+from validators import (
+    validate_json, validate_query_params, validate_trading_config,
+    validate_credentials, create_api_response, validate_pagination_params,
+    sanitize_input
+)
+from schemas import (
+    TradingConfigSchema, UserCredentialsSchema, APIResponseSchema,
+    PaginationSchema
+)
+
+# Import rate limiting
+from rate_limiter import (
+    limit_login, limit_register, limit_api, limit_config,
+    limit_bot_control, limit_force_trade, cleanup_rate_limiter,
+    get_rate_limiter_stats
+)
+
+# Import cache system
+from cache import get_cache, cached, cache_user_data, invalidate_user_cache
 
 # Import models
 try:
-    from models import db, User, TradingConfig, TradeHistory, MLModel, SystemLog, MarketData
+    from models import User, TradingConfig, TradeHistory, MLModel, SystemLog, SessionTargets, MarketData
 except ImportError as e:
     logging.error(f"Error importing models in routes: {e}")
     raise
@@ -54,32 +77,76 @@ main = Blueprint('main', __name__)
 # Initialize services
 logger = logging.getLogger(__name__)
 
-# Cache global para saldos dos usuários
-balance_cache = {}
-CACHE_DURATION = 300  # 5 minutos em segundos
+def convert_numpy_to_json_serializable(obj):
+    """Convert numpy arrays and other non-serializable objects to JSON-serializable types"""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_to_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_json_serializable(item) for item in obj]
+    elif hasattr(obj, 'isoformat'):  # datetime objects
+        return obj.isoformat()
+    else:
+        return obj
 
-def get_cached_balance(user_id: int, account_type: str = 'PRACTICE') -> float:
-    """Get balance from cache if available and not expired"""
-    cache_key = f"{user_id}_{account_type}"
-    if cache_key in balance_cache:
-        cached_data = balance_cache[cache_key]
-        if time.time() - cached_data['timestamp'] < CACHE_DURATION:
-            logger.info(f"Using cached balance for user {user_id} ({account_type}): ${cached_data['balance']}")
-            return cached_data['balance']
-        else:
-            # Cache expired, remove it
-            del balance_cache[cache_key]
-            logger.info(f"Cache expired for user {user_id} ({account_type})")
+# Connection failures tracking
+connection_failures = {}  # Track connection failures
+FAILURE_COOLDOWN = 600  # 10 minutos de cooldown após falha
+MAX_FAILURES = 3  # Máximo de falhas antes do cooldown
+
+def get_cached_balance(user_id: int, account_type: str = 'PRACTICE') -> Optional[float]:
+    """Get balance from cache using new cache system"""
+    cache = get_cache()
+    cache_key = f"balance:{user_id}:{account_type}"
+    balance = cache.get(cache_key)
+    
+    if balance is not None:
+        logger.info(f"Using cached balance for user {user_id} ({account_type}): ${balance}")
+        return balance
+    
     return None
 
 def set_cached_balance(user_id: int, balance: float, account_type: str = 'PRACTICE'):
-    """Set balance in cache with current timestamp"""
-    cache_key = f"{user_id}_{account_type}"
-    balance_cache[cache_key] = {
-        'balance': balance,
-        'timestamp': time.time()
-    }
+    """Set balance in cache using new cache system"""
+    cache = get_cache()
+    cache_key = f"balance:{user_id}:{account_type}"
+    # Cache balance for 5 minutes
+    cache.set(cache_key, balance, timeout=300)
     logger.info(f"Cached balance for user {user_id} ({account_type}): ${balance}")
+
+def should_skip_connection(user_id: int) -> bool:
+    """Check if we should skip connection due to recent failures"""
+    if user_id in connection_failures:
+        failure_data = connection_failures[user_id]
+        if failure_data['count'] >= MAX_FAILURES:
+            time_since_last_failure = time.time() - failure_data['last_failure']
+            if time_since_last_failure < FAILURE_COOLDOWN:
+                logger.warning(f"Skipping IQ Option connection for user {user_id} due to recent failures (cooldown: {FAILURE_COOLDOWN - time_since_last_failure:.0f}s remaining)")
+                return True
+            else:
+                # Reset failures after cooldown
+                del connection_failures[user_id]
+    return False
+
+def record_connection_failure(user_id: int):
+    """Record a connection failure"""
+    if user_id not in connection_failures:
+        connection_failures[user_id] = {'count': 0, 'last_failure': 0}
+    
+    connection_failures[user_id]['count'] += 1
+    connection_failures[user_id]['last_failure'] = time.time()
+    logger.warning(f"Recorded connection failure for user {user_id} (total: {connection_failures[user_id]['count']})")
+
+def record_connection_success(user_id: int):
+    """Record a successful connection (reset failures)"""
+    if user_id in connection_failures:
+        del connection_failures[user_id]
+        logger.info(f"Reset connection failures for user {user_id}")
 
 # Blacklist for JWT tokens
 blacklisted_tokens = set()
@@ -155,8 +222,9 @@ def register_redirect():
 
 # Authentication routes
 @api.route('/auth/register', methods=['POST'])
+@limit_register
 def register():
-    """Register a new user"""
+    """Register a new user with validation"""
     try:
         data = request.get_json()
         
@@ -166,89 +234,198 @@ def register():
         
         if not data:
             logger.warning("No JSON data received in registration request")
-            return jsonify({'message': 'Dados não fornecidos'}), 400
+            return jsonify(create_api_response(
+                success=False,
+                message='Dados não fornecidos',
+                errors=['JSON data is required']
+            )), 400
+        
+        # Sanitize input data
+        sanitized_data = sanitize_input(data)
         
         # Validate required fields
         required_fields = ['name', 'email', 'password', 'iq_email', 'iq_password']
-        for field in required_fields:
-            if not data.get(field):
-                logger.warning(f"Missing required field: {field}")
-                return jsonify({'message': f'Campo {field} é obrigatório'}), 400
+        missing_fields = [field for field in required_fields if not sanitized_data.get(field)]
+        
+        if missing_fields:
+            logger.warning(f"Missing required fields: {missing_fields}")
+            return jsonify(create_api_response(
+                success=False,
+                message='Campos obrigatórios não fornecidos',
+                errors=[f'Campo {field} é obrigatório' for field in missing_fields]
+            )), 400
         
         # Validate password confirmation if provided
-        if 'password_confirm' in data and data['password'] != data['password_confirm']:
-            logger.warning(f"Password confirmation mismatch for email: {data.get('email')}")
-            return jsonify({'message': 'As senhas não coincidem'}), 400
+        if 'password_confirm' in sanitized_data and sanitized_data['password'] != sanitized_data['password_confirm']:
+            logger.warning(f"Password confirmation mismatch for email: {sanitized_data.get('email')}")
+            return jsonify(create_api_response(
+                success=False,
+                message='As senhas não coincidem',
+                errors=['Password confirmation does not match']
+            )), 400
+        
+        # Validate credentials using schema
+        try:
+            credentials = validate_credentials({
+                'iq_email': sanitized_data['iq_email'],
+                'iq_password': sanitized_data['iq_password']
+            })
+        except ValueError as e:
+            logger.warning(f"Credential validation failed: {str(e)}")
+            return jsonify(create_api_response(
+                success=False,
+                message='Credenciais inválidas',
+                errors=[str(e)]
+            )), 400
+        
+        # Additional validations
+        if len(sanitized_data['name']) < 2:
+            return jsonify(create_api_response(
+                success=False,
+                message='Nome deve ter pelo menos 2 caracteres',
+                errors=['Name too short']
+            )), 400
+        
+        if len(sanitized_data['password']) < 6:
+            return jsonify(create_api_response(
+                success=False,
+                message='Senha deve ter pelo menos 6 caracteres',
+                errors=['Password too short']
+            )), 400
         
         # Check if user already exists
-        existing_user = User.query.filter_by(email=data['email']).first()
+        existing_user = User.query.filter_by(email=sanitized_data['email']).first()
         if existing_user:
-            logger.warning(f"Registration attempt with existing email: {data.get('email')}")
-            return jsonify({'message': 'Email já cadastrado'}), 400
+            logger.warning(f"Registration attempt with existing email: {sanitized_data.get('email')}")
+            return jsonify(create_api_response(
+                success=False,
+                message='Email já cadastrado',
+                errors=['Email already exists']
+            )), 400
         
-        logger.info(f"All validations passed, creating user: {data.get('email')}")
+        logger.info(f"All validations passed, creating user: {sanitized_data.get('email')}")
         
         # Create new user (always starts with PRACTICE account)
         user = User(
-            name=data['name'],
-            email=data['email'],
-            password_hash=generate_password_hash(data['password']),
-            iq_email=data['iq_email'],
-            iq_password=data['iq_password'],  # This should be encrypted in production
+            name=sanitized_data['name'],
+            email=sanitized_data['email'],
+            password_hash=generate_password_hash(sanitized_data['password']),
+            iq_email=credentials.iq_email,
+            iq_password=credentials.iq_password,  # This should be encrypted in production
             account_type='PRACTICE'  # Always start with demo account
         )
         
         db.session.add(user)
         db.session.commit()
         
-        # Create default trading configuration
-        config = TradingConfig(
-            user_id=user.id,
-            asset='EURUSD',
-            trade_amount=10.0,
-            use_balance_percentage=True,
-            balance_percentage=2.0,
-            take_profit=70.0,
-            stop_loss=30.0,
-            martingale_enabled=True,
-            max_martingale_levels=3,
-            morning_start='10:00',
-            afternoon_start='14:00',
-            operation_mode='manual'
-        )
+        # Create default trading configuration with validation
+        default_config_data = {
+            'asset': 'EURUSD',
+            'trade_amount': 10.0,
+            'use_balance_percentage': True,
+            'balance_percentage': 2.0,
+            'take_profit': 70.0,
+            'martingale_enabled': True,
+            'max_martingale_levels': 3,
+            'morning_start': '10:00',
+            'afternoon_start': '14:00',
+            'morning_enabled': True,
+            'afternoon_enabled': True,
+            'night_enabled': False,
+            'continuous_mode': False,
+            'strategy_mode': 'intermediario',
+            'min_signal_score': 70,
+            'timeframe': '1m'
+        }
         
-        db.session.add(config)
-        db.session.commit()
+        try:
+            validated_config = validate_trading_config(default_config_data)
+            config = TradingConfig(
+                user_id=user.id,
+                asset=validated_config.asset,
+                trade_amount=validated_config.trade_amount,
+                use_balance_percentage=validated_config.use_balance_percentage,
+                balance_percentage=validated_config.balance_percentage,
+                take_profit=validated_config.take_profit,
+                martingale_enabled=validated_config.martingale_enabled,
+                max_martingale_levels=validated_config.max_martingale_levels,
+                morning_start=validated_config.morning_start,
+                afternoon_start=validated_config.afternoon_start,
+                operation_mode='manual',
+                strategy_mode=validated_config.strategy_mode,
+                min_signal_score=validated_config.min_signal_score,
+                timeframe=validated_config.timeframe
+            )
+            
+            db.session.add(config)
+            db.session.commit()
+        except ValueError as e:
+            logger.error(f"Error creating default config: {str(e)}")
+            # Continue without failing registration
         
         logger.info(f"New user registered: {user.email}")
         
-        return jsonify({
-            'message': 'Usuário criado com sucesso',
-            'user_id': user.id
-        }), 201
+        return jsonify(create_api_response(
+            success=True,
+            message='Usuário criado com sucesso',
+            data={'user_id': user.id}
+        )), 201
         
     except Exception as e:
         logger.error(f"Registration error: {str(e)}")
         db.session.rollback()
-        return jsonify({'message': 'Erro interno do servidor'}), 500
+        return jsonify(create_api_response(
+            success=False,
+            message='Erro interno do servidor',
+            errors=[str(e)]
+        )), 500
 
 @api.route('/auth/login', methods=['POST'])
+@limit_login
 def login_api():
-    """Authenticate user and return JWT token"""
+    """Authenticate user and return JWT token with validation"""
     try:
         data = request.get_json()
         
-        if not data.get('email') or not data.get('password'):
-            return jsonify({'message': 'Email e senha são obrigatórios'}), 400
+        if not data:
+            return jsonify(create_api_response(
+                success=False,
+                message='Dados de login não fornecidos',
+                errors=['Login data is required']
+            )), 400
         
-        user = User.query.filter_by(email=data['email']).first()
+        # Sanitize input data
+        sanitized_data = sanitize_input(data)
         
-        if not user or not check_password_hash(user.password_hash, data['password']):
-            return jsonify({'message': 'Credenciais inválidas'}), 401
+        if not sanitized_data.get('email') or not sanitized_data.get('password'):
+            return jsonify(create_api_response(
+                success=False,
+                message='Email e senha são obrigatórios',
+                errors=['Email and password are required']
+            )), 400
         
-        # Update account type if provided
-        account_type = data.get('account_type')
-        if account_type and user.account_type != account_type:
+        # Validate email format
+        email = sanitized_data['email'].lower().strip()
+        if '@' not in email or '.' not in email:
+            return jsonify(create_api_response(
+                success=False,
+                message='Formato de email inválido',
+                errors=['Invalid email format']
+            )), 400
+        
+        user = User.query.filter_by(email=email).first()
+        
+        if not user or not check_password_hash(user.password_hash, sanitized_data['password']):
+            logger.warning(f"Failed login attempt for email: {email}")
+            return jsonify(create_api_response(
+                success=False,
+                message='Credenciais inválidas',
+                errors=['Invalid credentials']
+            )), 401
+        
+        # Update account type if provided and valid
+        account_type = sanitized_data.get('account_type')
+        if account_type and account_type in ['PRACTICE', 'REAL'] and user.account_type != account_type:
             user.account_type = account_type
             logger.info(f"Updated account type for user {user.email} to {account_type}")
         
@@ -264,22 +441,31 @@ def login_api():
         
         logger.info(f"User logged in: {user.email}")
         
-        return jsonify({
-            'token': access_token,
-            'user': {
-                'id': user.id,
-                'name': user.name,
-                'email': user.email,
-                'account_type': user.account_type
+        return jsonify(create_api_response(
+            success=True,
+            message='Login realizado com sucesso',
+            data={
+                'token': access_token,
+                'user': {
+                    'id': user.id,
+                    'name': user.name,
+                    'email': user.email,
+                    'account_type': user.account_type
+                }
             }
-        }), 200
+        )), 200
         
     except Exception as e:
         logger.error(f"Login error: {str(e)}")
-        return jsonify({'message': 'Erro interno do servidor'}), 500
+        return jsonify(create_api_response(
+            success=False,
+            message='Erro interno do servidor',
+            errors=[str(e)]
+        )), 500
 
 @api.route('/auth/logout', methods=['POST'])
 @jwt_required()
+@limit_api
 def logout_api():
     """Logout user and blacklist token"""
     try:
@@ -288,15 +474,24 @@ def logout_api():
         
         logger.info(f"User logged out: {get_jwt_identity()}")
         
-        return jsonify({'message': 'Logout realizado com sucesso'}), 200
+        return jsonify(create_api_response(
+            success=True,
+            message='Logout realizado com sucesso'
+        )), 200
         
     except Exception as e:
         logger.error(f"Logout error: {str(e)}")
-        return jsonify({'message': 'Erro interno do servidor'}), 500
+        return jsonify(create_api_response(
+            success=False,
+            message='Erro interno do servidor',
+            errors=[str(e)]
+        )), 500
 
 # User routes
 @api.route('/user/profile', methods=['GET'])
 @jwt_required()
+@limit_api
+@cached(timeout=300, key_prefix='user_profile:')
 def get_user_profile():
     """Get user profile information"""
     try:
@@ -322,6 +517,8 @@ def get_user_profile():
 # Configuration routes
 @api.route('/config', methods=['GET'])
 @jwt_required()
+@limit_api
+@cached(timeout=300, key_prefix='user_config:')
 def get_config():
     """Get user's trading configuration"""
     try:
@@ -337,17 +534,23 @@ def get_config():
             'use_balance_percentage': config.use_balance_percentage,
             'balance_percentage': config.balance_percentage,
             'take_profit': config.take_profit,
-            'stop_loss': config.stop_loss,
+            # Stop loss is now based on losing all 3 martingale levels (no percentage)
             'martingale_enabled': config.martingale_enabled,
             'max_martingale_levels': config.max_martingale_levels,
             'morning_start': config.morning_start,
-            'morning_end': config.morning_end,
             'afternoon_start': config.afternoon_start,
-            'afternoon_end': config.afternoon_end,
+            'night_start': config.night_start,
+            'morning_enabled': getattr(config, 'morning_enabled', True),
+            'afternoon_enabled': getattr(config, 'afternoon_enabled', True),
+            'night_enabled': getattr(config, 'night_enabled', False),
+            'continuous_mode': getattr(config, 'continuous_mode', False),
+            'auto_restart': getattr(config, 'auto_restart', True),
+            'keep_connection': getattr(config, 'keep_connection', True),
             'operation_mode': config.operation_mode,
             'strategy_mode': config.strategy_mode,
             'min_signal_score': config.min_signal_score,
-            'timeframe': config.timeframe
+            'timeframe': config.timeframe,
+            'advance_signal_minutes': getattr(config, 'advance_signal_minutes', 2)
         }), 200
         
     except Exception as e:
@@ -356,35 +559,97 @@ def get_config():
 
 @api.route('/config', methods=['POST'])
 @jwt_required()
+@limit_config
 def save_config():
-    """Save user's trading configuration"""
+    """Save user's trading configuration with validation"""
     try:
         user_id = get_jwt_identity()
         data = request.get_json()
         
+        # Debug: Log received configuration data
+        logger.info(f"[DEBUG] Received config data: {data}")
+        logger.info(f"[DEBUG] Night fields: night_start={data.get('night_start')}, night_enabled={data.get('night_enabled')}, continuous_mode={data.get('continuous_mode')}")
+        
+        if not data:
+            return jsonify(create_api_response(
+                success=False,
+                message='Dados de configuração não fornecidos',
+                errors=['Configuration data is required']
+            )), 400
+        
+        # Sanitize input data
+        sanitized_data = sanitize_input(data)
+        
+        # Get existing configuration
         config = TradingConfig.query.filter_by(user_id=user_id).first()
         
+        # Prepare data for validation with defaults from existing config
+        config_data = {
+            'asset': sanitized_data.get('asset', config.asset if config else 'EURUSD'),
+            'trade_amount': sanitized_data.get('trade_amount', config.trade_amount if config else 10.0),
+            'use_balance_percentage': sanitized_data.get('use_balance_percentage', config.use_balance_percentage if config else False),
+            'balance_percentage': sanitized_data.get('balance_percentage', config.balance_percentage if config else None),
+            'take_profit': sanitized_data.get('take_profit', config.take_profit if config else 70.0),
+            'martingale_enabled': sanitized_data.get('martingale_enabled', config.martingale_enabled if config else True),
+            'max_martingale_levels': sanitized_data.get('max_martingale_levels', config.max_martingale_levels if config else 3),
+            'morning_start': sanitized_data.get('morning_start', config.morning_start if config else '10:00'),
+            'afternoon_start': sanitized_data.get('afternoon_start', config.afternoon_start if config else '14:00'),
+            'night_start': sanitized_data.get('night_start', config.night_start if config else None),
+            'morning_enabled': sanitized_data.get('morning_enabled', getattr(config, 'morning_enabled', True) if config else True),
+            'afternoon_enabled': sanitized_data.get('afternoon_enabled', getattr(config, 'afternoon_enabled', True) if config else True),
+            'night_enabled': sanitized_data.get('night_enabled', getattr(config, 'night_enabled', False) if config else False),
+            'continuous_mode': sanitized_data.get('continuous_mode', getattr(config, 'continuous_mode', False) if config else False),
+            'auto_restart': sanitized_data.get('auto_restart', getattr(config, 'auto_restart', True) if config else True),
+            'keep_connection': sanitized_data.get('keep_connection', getattr(config, 'keep_connection', True) if config else True),
+            'strategy_mode': sanitized_data.get('strategy_mode', config.strategy_mode if config else 'intermediario'),
+            'min_signal_score': sanitized_data.get('min_signal_score', config.min_signal_score if config else 70),
+            'timeframe': sanitized_data.get('timeframe', config.timeframe if config else '1m'),
+            'advance_signal_minutes': sanitized_data.get('advance_signal_minutes', getattr(config, 'advance_signal_minutes', 2) if config else 2),
+            'use_ml_signals': sanitized_data.get('use_ml_signals', False)
+        }
+        
+        # Validate configuration using schema
+        try:
+            validated_config = validate_trading_config(config_data)
+        except ValueError as e:
+            logger.warning(f"Configuration validation failed for user {user_id}: {str(e)}")
+            return jsonify(create_api_response(
+                success=False,
+                message='Configuração inválida',
+                errors=[str(e)]
+            )), 400
+        
+        # Create or update configuration
         if not config:
             config = TradingConfig(user_id=user_id)
         
-        # Update configuration
-        config.asset = data.get('asset', config.asset)
-        config.trade_amount = data.get('trade_amount', config.trade_amount)
-        config.use_balance_percentage = data.get('use_balance_percentage', config.use_balance_percentage)
-        config.balance_percentage = data.get('balance_percentage', config.balance_percentage)
-        config.take_profit = data.get('take_profit', config.take_profit)
-        config.stop_loss = data.get('stop_loss', config.stop_loss)
-        config.martingale_enabled = data.get('martingale_enabled', config.martingale_enabled)
-        config.max_martingale_levels = data.get('max_martingale_levels', config.max_martingale_levels)
-        config.morning_start = data.get('morning_start', config.morning_start)
-        config.morning_end = data.get('morning_end', config.morning_end)
-        config.afternoon_start = data.get('afternoon_start', config.afternoon_start)
-        config.afternoon_end = data.get('afternoon_end', config.afternoon_end)
-        config.operation_mode = data.get('operation_mode', config.operation_mode)
-        config.strategy_mode = data.get('strategy_mode', config.strategy_mode)
-        config.min_signal_score = data.get('min_signal_score', config.min_signal_score)
-        config.timeframe = data.get('timeframe', config.timeframe)
+        # Update configuration with validated data
+        config.asset = validated_config.asset
+        config.trade_amount = validated_config.trade_amount
+        config.use_balance_percentage = validated_config.use_balance_percentage
+        config.balance_percentage = validated_config.balance_percentage
+        config.take_profit = validated_config.take_profit
+        config.martingale_enabled = validated_config.martingale_enabled
+        config.max_martingale_levels = validated_config.max_martingale_levels
+        config.morning_start = validated_config.morning_start
+        config.afternoon_start = validated_config.afternoon_start
+        config.night_start = validated_config.night_start
+        config.morning_enabled = validated_config.morning_enabled
+        config.afternoon_enabled = validated_config.afternoon_enabled
+        config.night_enabled = validated_config.night_enabled
+        config.continuous_mode = validated_config.continuous_mode
+        config.auto_restart = validated_config.auto_restart
+        config.keep_connection = validated_config.keep_connection
+        config.strategy_mode = validated_config.strategy_mode
+        config.min_signal_score = validated_config.min_signal_score
+        config.timeframe = validated_config.timeframe
+        config.advance_signal_minutes = validated_config.advance_signal_minutes
         config.updated_at = datetime.utcnow()
+        
+        # Handle operation mode (not in schema but needed for compatibility)
+        operation_mode = sanitized_data.get('operation_mode', config.operation_mode if config else 'manual')
+        if operation_mode in ['auto', 'manual']:
+            config.operation_mode = operation_mode
         
         # Synchronize auto_mode with operation_mode
         if config.operation_mode == 'auto':
@@ -395,18 +660,44 @@ def save_config():
         db.session.add(config)
         db.session.commit()
         
+        # Invalidate user cache after configuration update
+        invalidate_user_cache(user_id)
+        
+        # Update running bot configuration if bot is active
+        import app as app_module
+        if app_module.trading_bot is not None and app_module.trading_bot.user_id == user_id:
+            try:
+                app_module.trading_bot.update_config(config)
+                logger.info(f"Updated running bot configuration for user: {user_id}")
+            except Exception as e:
+                logger.error(f"Error updating running bot configuration: {str(e)}")
+        
         logger.info(f"Configuration updated for user: {user_id}")
         
-        return jsonify({'message': 'Configuração salva com sucesso'}), 200
+        return jsonify(create_api_response(
+            success=True,
+            message='Configuração salva com sucesso',
+            data={
+                'asset': config.asset,
+                'trade_amount': config.trade_amount,
+                'strategy_mode': config.strategy_mode,
+                'timeframe': config.timeframe
+            }
+        )), 200
         
     except Exception as e:
         logger.error(f"Save config error: {str(e)}")
         db.session.rollback()
-        return jsonify({'message': 'Erro interno do servidor'}), 500
+        return jsonify(create_api_response(
+            success=False,
+            message='Erro interno do servidor',
+            errors=[str(e)]
+        )), 500
 
 # Bot control routes
 @api.route('/bot/start', methods=['POST'])
 @jwt_required()
+@limit_bot_control
 def start_bot():
     """Start the trading bot"""
     try:
@@ -459,6 +750,7 @@ def start_bot():
 
 @api.route('/bot/stop', methods=['POST'])
 @jwt_required()
+@limit_bot_control
 def stop_bot():
     """Stop the trading bot"""
     try:
@@ -498,6 +790,7 @@ def stop_bot():
 
 @api.route('/bot/status', methods=['GET'])
 @jwt_required()
+@limit_api
 def get_bot_status():
     """Get bot status"""
     try:
@@ -520,6 +813,7 @@ def get_bot_status():
 
 @api.route('/bot/force_trade', methods=['POST'])
 @jwt_required()
+@limit_force_trade
 def force_trade():
     """Force a trade in manual mode"""
     try:
@@ -558,32 +852,13 @@ def force_trade():
         logger.error(f"Force trade error: {str(e)}")
         return jsonify({'message': 'Erro interno do servidor'}), 500
 
-@api.route('/bot/test_stop_loss', methods=['POST'])
-@jwt_required()
-def test_stop_loss():
-    """Test Stop Loss notification"""
-    try:
-        import app as app_module
-        
-        user_id = get_jwt_identity()
-        
-        if app_module.trading_bot is None:
-            return jsonify({'message': 'Bot não está rodando'}), 400
-        
-        success = app_module.trading_bot.test_stop_loss_notification()
-        
-        if success:
-            return jsonify({'message': 'Notificação de Stop Loss enviada com sucesso'}), 200
-        else:
-            return jsonify({'message': 'Erro ao enviar notificação de teste'}), 500
-            
-    except Exception as e:
-        logger.error(f"Test stop loss error: {str(e)}")
-        return jsonify({'message': 'Erro interno do servidor'}), 500
+# Stop loss test route removed - stop loss is now based on losing all 3 martingale levels
 
 # Dashboard routes
 @api.route('/dashboard/stats', methods=['GET'])
 @jwt_required()
+@limit_api
+@cached(timeout=60, key_prefix='dashboard_stats:')
 def get_dashboard_stats():
     """Get dashboard statistics"""
     try:
@@ -658,46 +933,71 @@ def get_dashboard_stats():
             logger.info(f"Got balance from running bot: ${balance}")
             # Update cache with bot balance
             set_cached_balance(user_id, balance, account_type)
+            # Record successful connection since bot is working
+            record_connection_success(user_id)
         else:
             # Try to get from cache first
             cached_balance = get_cached_balance(user_id, account_type)
             if cached_balance is not None:
                 balance = cached_balance
             else:
-                # If no cache, connect temporarily to get real balance
-                try:
-                    if user and user.iq_email and user.iq_password:
-                        from services.iq_option_service import IQOptionService
-                        temp_service = IQOptionService(user.iq_email, user.iq_password)
-                        logger.info(f"Connecting to IQ Option to get {account_type} balance...")
-                        if temp_service.connect():
-                            # Set account type before getting balance
-                            if temp_service.set_account_type(account_type):
-                                real_balance = temp_service.update_balance()
-                                if real_balance > 0:
-                                    balance = real_balance
-                                    logger.info(f"Retrieved {account_type} balance from IQ Option: ${balance}")
-                                    # Cache the balance
-                                    set_cached_balance(user_id, balance, account_type)
+                # Check if we should skip connection due to recent failures
+                if should_skip_connection(user_id):
+                    logger.info(f"Using fallback balance ${balance} due to connection cooldown")
+                else:
+                    # If no cache, connect temporarily to get real balance
+                    try:
+                        if user and user.iq_email and user.iq_password:
+                            from services.iq_option_service import IQOptionService
+                            temp_service = IQOptionService(user.iq_email, user.iq_password)
+                            logger.info(f"Connecting to IQ Option to get {account_type} balance...")
+                            
+                            # Set a shorter timeout for dashboard requests
+                            connection_success = False
+                            try:
+                                connection_success = temp_service.connect(timeout=10)  # 10 second timeout
+                            except Exception as conn_e:
+                                logger.error(f"Connection timeout/error: {str(conn_e)}")
+                                record_connection_failure(user_id)
+                                connection_success = False
+                            
+                            if connection_success:
+                                # Set account type before getting balance
+                                if temp_service.set_account_type(account_type):
+                                    real_balance = temp_service.update_balance()
+                                    if real_balance > 0:
+                                        balance = real_balance
+                                        logger.info(f"Retrieved {account_type} balance from IQ Option: ${balance}")
+                                        # Cache the balance
+                                        set_cached_balance(user_id, balance, account_type)
+                                        # Record successful connection
+                                        record_connection_success(user_id)
+                                    else:
+                                        logger.warning(f"IQ Option returned 0 balance for {account_type}")
+                                        record_connection_failure(user_id)
                                 else:
-                                    logger.warning(f"IQ Option returned 0 balance for {account_type}")
+                                    logger.warning(f"Failed to set account type to {account_type}")
+                                    record_connection_failure(user_id)
+                                temp_service.disconnect()
+                                logger.info("Disconnected from IQ Option")
                             else:
-                                logger.warning(f"Failed to set account type to {account_type}")
-                            temp_service.disconnect()
-                            logger.info("Disconnected from IQ Option")
+                                logger.error("Failed to connect to IQ Option for balance")
+                                record_connection_failure(user_id)
                         else:
-                            logger.error("Failed to connect to IQ Option for balance")
-                    else:
-                        logger.warning("No IQ Option credentials found for user")
-                except Exception as e:
-                    logger.error(f"Error getting {account_type} balance: {str(e)}")
+                            logger.warning("No IQ Option credentials found for user")
+                    except Exception as e:
+                        logger.error(f"Error getting {account_type} balance: {str(e)}")
+                        record_connection_failure(user_id)
+        
+        # Get today's session targets
+        session_targets = get_today_session_targets(user_id)
         
         # Include Take Profit and Stop Loss information from bot status
         response_data = {
             'balance': balance,
             'today_profit': today_profit,
             'win_rate': win_rate,
-            'bot_status': 'running' if bot_status.get('running', False) else 'stopped',
+            'bot_status': bot_status,  # Return the full bot status object instead of string
             'total_trades': total_trades,
             'win_trades': win_trades,
             'loss_trades': loss_trades,
@@ -707,25 +1007,32 @@ def get_dashboard_stats():
             'recent_trades': recent_trades_data,
             'profit_history': profit_history,
             'last_trade': recent_trades_data[0] if recent_trades_data else None,
-            'next_schedule': get_next_schedule(user_id)
+            'next_schedule': get_next_schedule(user_id),
+            'session_targets': session_targets
         }
         
         # Add Take Profit and Stop Loss information if bot is running
         if bot_status.get('running', False) and app_module.trading_bot is not None:
             full_status = app_module.trading_bot.get_status()
+            # Convert last_signal to JSON-serializable format
+            last_signal = full_status.get('last_signal', None)
+            if last_signal:
+                last_signal = convert_numpy_to_json_serializable(last_signal)
+            
             response_data.update({
                 'session_profit': full_status.get('session_profit', 0),
                 'take_profit_target': full_status.get('take_profit_target', 0),
-                'stop_loss_target': full_status.get('stop_loss_target', 0),
+                'stop_loss_method': full_status.get('stop_loss_method', 'Martingale 3 levels'),
                 'take_profit_reached': full_status.get('take_profit_reached', False),
-                'stop_loss_reached': full_status.get('stop_loss_reached', False)
+                'stop_loss_reached': full_status.get('stop_loss_reached', False),
+                'last_signal': last_signal
             })
         else:
             # Default values when bot is not running
             response_data.update({
                 'session_profit': 0,
                 'take_profit_target': 0,
-                'stop_loss_target': 0,
+                'stop_loss_method': 'Martingale 3 levels',
                 'take_profit_reached': False,
                 'stop_loss_reached': False
             })
@@ -739,6 +1046,8 @@ def get_dashboard_stats():
 # Trade history routes
 @api.route('/trades/history', methods=['GET'])
 @jwt_required()
+@limit_api
+@cached(timeout=180, key_prefix='trade_history:')
 def get_trade_history():
     """Get trade history with pagination and filters"""
     try:
@@ -852,33 +1161,110 @@ def get_profit_history(user_id, days=7, account_type='PRACTICE'):
         'data': data
     }
 
+def get_today_session_targets(user_id):
+    """Get today's session targets status"""
+    try:
+        today = datetime.now().date()
+        
+        # Get all session targets for today
+        session_targets = SessionTargets.query.filter(
+            SessionTargets.user_id == user_id,
+            SessionTargets.date == today
+        ).all()
+        
+        # Create a dictionary with session status
+        targets_data = {
+            'morning': {
+                'take_profit_reached': False,
+                'stop_loss_reached': False,
+                'session_profit': 0.0,
+                'total_trades': 0,
+                'target_reached_at': None
+            },
+            'afternoon': {
+                'take_profit_reached': False,
+                'stop_loss_reached': False,
+                'session_profit': 0.0,
+                'total_trades': 0,
+                'target_reached_at': None
+            },
+            'night': {
+                'take_profit_reached': False,
+                'stop_loss_reached': False,
+                'session_profit': 0.0,
+                'total_trades': 0,
+                'target_reached_at': None
+            }
+        }
+        
+        # Update with actual data
+        for target in session_targets:
+            if target.session_type in targets_data:
+                targets_data[target.session_type] = {
+                    'take_profit_reached': target.take_profit_reached,
+                    'stop_loss_reached': target.stop_loss_reached,
+                    'session_profit': target.session_profit,
+                    'total_trades': target.total_trades,
+                    'target_reached_at': target.target_reached_at.strftime('%H:%M:%S') if target.target_reached_at else None
+                }
+        
+        return targets_data
+        
+    except Exception as e:
+        logger.error(f"Error getting session targets: {e}")
+        return {
+            'morning': {'take_profit_reached': False, 'stop_loss_reached': False, 'session_profit': 0.0, 'total_trades': 0, 'target_reached_at': None},
+            'afternoon': {'take_profit_reached': False, 'stop_loss_reached': False, 'session_profit': 0.0, 'total_trades': 0, 'target_reached_at': None},
+            'night': {'take_profit_reached': False, 'stop_loss_reached': False, 'session_profit': 0.0, 'total_trades': 0, 'target_reached_at': None}
+        }
+
 def get_next_schedule(user_id):
     """Get next scheduled trading session"""
-    config = TradingConfig.query.filter_by(user_id=user_id).first()
-    if not config:
+    try:
+        config = TradingConfig.query.filter_by(user_id=user_id).first()
+        if not config or config.operation_mode != 'auto':
+            return "Não Programado"
+        
+        now = datetime.now()
+        current_time = now.time()
+        
+        # List of all sessions with their times
+        sessions = []
+        
+        if config.morning_start and getattr(config, 'morning_enabled', True):
+            morning_start = datetime.strptime(config.morning_start, '%H:%M').time()
+            sessions.append(('morning', morning_start, config.morning_start))
+        
+        if config.afternoon_start and getattr(config, 'afternoon_enabled', True):
+            afternoon_start = datetime.strptime(config.afternoon_start, '%H:%M').time()
+            sessions.append(('afternoon', afternoon_start, config.afternoon_start))
+        
+        if config.night_start and getattr(config, 'night_enabled', False):
+            night_start = datetime.strptime(config.night_start, '%H:%M').time()
+            sessions.append(('night', night_start, config.night_start))
+        
+        # Sort sessions by time
+        sessions.sort(key=lambda x: x[1])
+        
+        # Find next session today
+        for session_name, session_time, session_str in sessions:
+            if current_time < session_time:
+                return f"Hoje {session_str}"
+        
+        # If all sessions passed today, get first session tomorrow
+        if sessions:
+            return f"Amanhã {sessions[0][2]}"
+        
         return "Não Programado"
-    
-    # If operation mode is manual, return "Não Programado"
-    if config.operation_mode != 'auto':
-        return "Não Programado"
-    
-    now = datetime.now()
-    morning_time = datetime.strptime(config.morning_start, '%H:%M').time()
-    afternoon_time = datetime.strptime(config.afternoon_start, '%H:%M').time()
-    
-    # Check if we're before morning session
-    if now.time() < morning_time:
-        return config.morning_start
-    # Check if we're before afternoon session
-    elif now.time() < afternoon_time:
-        return config.afternoon_start
-    # Next session is tomorrow morning
-    else:
-        return f"Amanhã {config.morning_start}"
+        
+    except Exception as e:
+        logger.error(f"Error getting next schedule: {e}")
+        return "Erro"
 
 # Machine Learning routes
 @api.route('/ml/models', methods=['GET'])
 @jwt_required()
+@limit_api
 def get_ml_models():
     """Get ML model performance and statistics"""
     try:
@@ -904,6 +1290,7 @@ def get_ml_models():
 
 @api.route('/ml/retrain', methods=['POST'])
 @jwt_required()
+@limit_api
 def manual_retrain():
     """Manually trigger model retraining"""
     try:
@@ -943,6 +1330,7 @@ def manual_retrain():
 
 @api.route('/ml/status', methods=['GET'])
 @jwt_required()
+@limit_api
 def get_ml_status():
     """Get ML system status and configuration"""
     try:
@@ -981,6 +1369,129 @@ def get_ml_status():
         logger.error(f"Get ML status error: {str(e)}")
         return jsonify({'message': 'Erro ao obter status do ML'}), 500
 
+# Rate Limiter monitoring endpoint
+@api.route('/admin/rate-limiter/stats', methods=['GET'])
+@jwt_required()
+@limit_api
+def get_rate_limiter_stats_endpoint():
+    """Get rate limiter statistics (admin only)"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        # Check if user is admin (you can implement your own admin check logic)
+        # For now, we'll allow any authenticated user to see stats
+        
+        stats = get_rate_limiter_stats()
+        
+        return jsonify({
+            'success': True,
+            'data': stats,
+            'message': 'Estatísticas do rate limiter obtidas com sucesso'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Get rate limiter stats error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Erro ao obter estatísticas do rate limiter'
+        }), 500
+
+# Rate limiter cleanup endpoint
+@api.route('/admin/rate-limiter/cleanup', methods=['POST'])
+@jwt_required()
+@limit_api
+def cleanup_rate_limiter_endpoint():
+    """Manually trigger rate limiter cleanup"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        # Check if user is admin (you can implement your own admin check logic)
+        # For now, we'll allow any authenticated user to trigger cleanup
+        
+        cleanup_rate_limiter()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Limpeza do rate limiter executada com sucesso'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Rate limiter cleanup error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Erro ao executar limpeza do rate limiter'
+        }), 500
+
+# Cache monitoring endpoint
+@api.route('/admin/cache/stats', methods=['GET'])
+@jwt_required()
+@limit_api
+def get_cache_stats_endpoint():
+    """Get cache system statistics"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        # Check if user is admin (you can implement your own admin check logic)
+        # For now, we'll allow any authenticated user to see cache stats
+        
+        cache = get_cache()
+        stats = cache.get_stats()
+        
+        return jsonify({
+            'success': True,
+            'data': stats,
+            'message': 'Estatísticas do cache obtidas com sucesso'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Get cache stats error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Erro ao obter estatísticas do cache'
+        }), 500
+
+# Cache cleanup endpoint
+@api.route('/admin/cache/clear', methods=['POST'])
+@jwt_required()
+@limit_api
+def clear_cache_endpoint():
+    """Clear cache data"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        # Check if user is admin (you can implement your own admin check logic)
+        # For now, we'll allow any authenticated user to clear cache
+        
+        data = request.get_json() or {}
+        pattern = data.get('pattern', '*')  # Default to clear all
+        
+        cache = get_cache()
+        
+        if pattern == '*':
+            # Clear all cache
+            cache.clear_all()
+            message = 'Todo o cache foi limpo com sucesso'
+        else:
+            # Clear specific pattern
+            cache.clear_pattern(pattern)
+            message = f'Cache com padrão "{pattern}" foi limpo com sucesso'
+        
+        return jsonify({
+            'success': True,
+            'message': message
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Clear cache error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Erro ao limpar cache'
+        }), 500
+
 # JWT token blacklist check
 @api.before_request
 def check_if_token_revoked():
@@ -992,6 +1503,18 @@ def check_if_token_revoked():
                 return jsonify({'message': 'Token inválido'}), 401
         except:
             pass  # No JWT token present
+
+# Periodic cleanup task (should be called by a scheduler)
+@api.before_request
+def periodic_rate_limiter_cleanup():
+    """Periodic cleanup of rate limiter data"""
+    import random
+    # Only run cleanup randomly (1% chance per request) to avoid overhead
+    if random.random() < 0.01:
+        try:
+            cleanup_rate_limiter()
+        except Exception as e:
+            logger.error(f"Periodic rate limiter cleanup error: {str(e)}")
 
 # Error handlers
 @api.errorhandler(404)

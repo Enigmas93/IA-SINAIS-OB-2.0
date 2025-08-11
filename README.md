@@ -103,7 +103,7 @@ JWT_ACCESS_TOKEN_EXPIRES=604800
 DEFAULT_TRADE_AMOUNT=10.0
 DEFAULT_MARTINGALE_LEVELS=3
 DEFAULT_TAKE_PROFIT=70.0
-DEFAULT_STOP_LOSS=30.0
+# Stop loss is now based on losing all 3 martingale levels (no percentage needed)
 
 # Security
 RATE_LIMIT_PER_MINUTE=60
@@ -139,7 +139,8 @@ A aplicação estará disponível em: `http://localhost:5000`
 2. Configure:
    - **Ativo**: Par de moedas para operar
    - **Valor por Entrada**: Valor fixo ou % do saldo
-   - **Take Profit/Stop Loss**: Metas de lucro e perda
+   - **Take Profit**: Meta de lucro por porcentagem
+   - **Stop Loss**: Baseado na perda dos 3 níveis de martingale
    - **Martingale**: Níveis de recuperação
    - **Horários**: Sessões manhã e tarde
    - **Modo**: Automático ou Manual
@@ -154,7 +155,7 @@ A aplicação estará disponível em: `http://localhost:5000`
 1. Configure o modo "Automático"
 2. Defina os horários de operação
 3. O bot iniciará automaticamente nos horários definidos
-4. Pausará ao atingir take profit ou stop loss
+4. Pausará ao atingir take profit ou após perder os 3 níveis de martingale
 
 ### 5. Monitoramento
 - **Dashboard**: Visão geral em tempo real

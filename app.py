@@ -70,6 +70,39 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Make socketio available globally
 app.socketio = socketio
 
+# Initialize rate limiter and cache with centralized config
+try:
+    from config import get_config
+    from rate_limiter import initialize_rate_limiter, limit_api
+    from cache import initialize_cache
+    
+    # Get configuration based on environment
+    config = get_config()
+    
+    # Initialize rate limiter with config
+    initialize_rate_limiter(config)
+    logger.info("Rate limiter inicializado com configurações centralizadas")
+    
+    # Initialize cache system with config
+    initialize_cache(config)
+    logger.info("Sistema de cache inicializado com configurações centralizadas")
+    
+except ImportError as e:
+    logger.warning(f"Erro ao importar configurações centralizadas: {e}")
+    # Initialize systems without config (fallback)
+    try:
+        from rate_limiter import initialize_rate_limiter
+        from cache import initialize_cache
+        
+        initialize_rate_limiter()
+        logger.info("Rate limiter inicializado com configurações padrão")
+        
+        initialize_cache()
+        logger.info("Sistema de cache inicializado com configurações padrão")
+        
+    except ImportError as e2:
+        logger.error(f"Erro ao inicializar sistemas: {e2}")
+
 # Configure logging
 log_handlers = [logging.StreamHandler()]
 log_file = os.getenv('LOG_FILE', 'logs/trading_bot.log')
@@ -216,6 +249,7 @@ def get_or_create_trading_bot():
 
 @app.route('/api/iq-credentials', methods=['GET', 'POST'])
 @jwt_required()
+@limit_api
 def iq_credentials():
     """Get or update IQ Option credentials"""
     user_id = get_jwt_identity()
@@ -250,6 +284,7 @@ def iq_credentials():
 
 @app.route('/api/trades')
 @jwt_required()
+@limit_api
 def get_trades():
     """Get trade history"""
     user_id = get_jwt_identity()
@@ -293,36 +328,7 @@ def get_trades():
     })
 
 # User profile endpoint moved to routes.py
-
-@app.route('/api/dashboard/stats')
-@jwt_required()
-def get_dashboard_stats():
-    """Get dashboard statistics"""
-    user_id = get_jwt_identity()
-    
-    # Get today's trades
-    today = datetime.now().date()
-    today_trades = TradeHistory.query.filter(
-        TradeHistory.user_id == user_id,
-        TradeHistory.timestamp >= today
-    ).all()
-    
-    # Calculate stats
-    total_trades_today = len(today_trades)
-    wins_today = len([t for t in today_trades if t.result == 'win'])
-    profit_today = sum([t.profit for t in today_trades])
-    win_rate_today = (wins_today / total_trades_today * 100) if total_trades_today > 0 else 0
-    
-    return jsonify({
-        'success': True,
-        'stats': {
-            'trades_today': total_trades_today,
-            'wins_today': wins_today,
-            'profit_today': profit_today,
-            'win_rate_today': win_rate_today,
-            'current_balance': 1000.0  # Placeholder - should come from IQ Option API
-        }
-    })
+# Dashboard stats endpoint moved to routes.py
 
 # WebSocket endpoint temporarily disabled to avoid 400 errors
 # @app.route('/ws')
@@ -332,6 +338,7 @@ def get_dashboard_stats():
 
 @app.route('/api/statistics')
 @jwt_required()
+@limit_api
 def get_statistics():
     """Get trading statistics"""
     user_id = get_jwt_identity()
@@ -397,6 +404,81 @@ def get_statistics():
             'avg_profit_per_trade': round(avg_profit, 2)
         }
     })
+
+# WebSocket events
+@socketio.on('connect')
+def handle_connect(auth):
+    """Handle client connection"""
+    try:
+        # Get user ID from JWT token if provided
+        if auth and 'token' in auth:
+            from flask_jwt_extended import decode_token
+            try:
+                decoded_token = decode_token(auth['token'])
+                user_id = decoded_token['sub']
+                
+                # Join user-specific room
+                join_room(f'user_{user_id}')
+                logger.info(f"User {user_id} connected and joined room user_{user_id}")
+                
+                # Send connection confirmation
+                emit('connection_status', {
+                    'status': 'connected',
+                    'user_id': user_id,
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+            except Exception as e:
+                logger.error(f"Error processing auth token: {e}")
+                emit('connection_status', {
+                    'status': 'connected',
+                    'error': 'Invalid token',
+                    'timestamp': datetime.now().isoformat()
+                })
+        else:
+            logger.info("Client connected without authentication")
+            emit('connection_status', {
+                'status': 'connected',
+                'timestamp': datetime.now().isoformat()
+            })
+            
+    except Exception as e:
+        logger.error(f"Error in WebSocket connect handler: {e}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    logger.info("Client disconnected")
+
+@socketio.on('join_user_room')
+def handle_join_user_room(data):
+    """Handle user joining their specific room"""
+    try:
+        user_id = data.get('user_id')
+        if user_id:
+            join_room(f'user_{user_id}')
+            logger.info(f"User {user_id} manually joined room user_{user_id}")
+            emit('room_joined', {
+                'room': f'user_{user_id}',
+                'timestamp': datetime.now().isoformat()
+            })
+    except Exception as e:
+        logger.error(f"Error joining user room: {e}")
+
+@socketio.on('leave_user_room')
+def handle_leave_user_room(data):
+    """Handle user leaving their specific room"""
+    try:
+        user_id = data.get('user_id')
+        if user_id:
+            leave_room(f'user_{user_id}')
+            logger.info(f"User {user_id} left room user_{user_id}")
+            emit('room_left', {
+                'room': f'user_{user_id}',
+                'timestamp': datetime.now().isoformat()
+            })
+    except Exception as e:
+        logger.error(f"Error leaving user room: {e}")
 
 # Create application factory function
 def create_app():
